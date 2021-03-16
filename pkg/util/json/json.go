@@ -816,15 +816,19 @@ func EncodeContainedInvertedIndexSpans(
 	invertedExpr, err = json.encodeContainedInvertedIndexSpans(
 		encoding.EncodeJSONAscending(b), true, /* isRoot */
 	)
-	// The produced InvertedExpression will never be tight. This is because the
+	if err != nil {
+		return nil, err
+	}
+	// The produced inverted expression will never be tight. This is because the
 	// span expression produced will match all objects that contain at least one
-	// of the keys, which does not guarantee they only contains the keys.
+	// of the keys, which does not guarantee they only contain the keys.
 	// In other words, there may be false positives included that will need to
 	// pass through an additional filter.
-	if invertedExpr != nil {
-		invertedExpr.SetNotTight()
-	}
-	return invertedExpr, err
+	// For example, the spans produced for '{"a": "b"}' will include both
+	// '{"a": "b"}' and '{"a": "b", "c", "d"}', but the second row should be
+	// filtered out since '{"a": "b", "c", "d"}' <@ '{"a": "b"}' is false.
+	invertedExpr.SetNotTight()
+	return invertedExpr, nil
 }
 
 func (j jsonNull) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -1142,24 +1146,17 @@ func (j jsonObject) encodeContainedInvertedIndexSpans(
 		// should include the span for '{"a": {}}', and '{"a": [1]}' should include
 		// '{"a": []}'.
 		if !end {
-			var v JSON
-			jsonDecoded := j[i].v.MaybeDecode()
-			switch jsonDecoded.(type) {
-			case jsonArray:
-				v = emptyJSONArray
-			case jsonObject:
-				v = emptyJSONObject
-			default:
-				continue
+			v := emptyJSONForType(j[i].v)
+			if v != nil {
+				prefixWithEnd := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], string(j[i].k), true)
+				childWithEnd, err := v.encodeContainedInvertedIndexSpans(
+					prefixWithEnd, false, /* isRoot */
+				)
+				if err != nil {
+					return nil, err
+				}
+				invertedExpr = inverted.Or(invertedExpr, childWithEnd)
 			}
-			prefixWithEnd := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], string(j[i].k), true)
-			childWithEnd, err := v.encodeContainedInvertedIndexSpans(
-				prefixWithEnd, false, /* isRoot */
-			)
-			if err != nil {
-				return nil, err
-			}
-			invertedExpr = inverted.Or(invertedExpr, childWithEnd)
 		}
 	}
 
@@ -1186,6 +1183,29 @@ func isEnd(json JSON) bool {
 		}
 	}
 	return end
+}
+
+// emptyJSONForType returns either an empty JSON array or object corresponding
+// to the input JSON type. If the provided JSON is not an object or array, it
+// returns nil.
+func emptyJSONForType(json JSON) JSON {
+	switch t := json.(type) {
+	case jsonArray:
+		return emptyJSONArray
+
+	case jsonObject:
+		return emptyJSONObject
+
+	case *jsonEncoded:
+		switch t.typ {
+		case ArrayJSONType:
+			return emptyJSONArray
+
+		case ObjectJSONType:
+			return emptyJSONObject
+		}
+	}
+	return nil
 }
 
 // encodeContainingInvertedIndexSpansFromLeaf encodes the spans that must be

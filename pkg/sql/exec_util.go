@@ -236,6 +236,13 @@ var dropEnumValueEnabledClusterMode = settings.RegisterBoolSetting(
 	false,
 )
 
+var overrideMultiRegionZoneConfigClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.override_multi_region_zone_config.enabled",
+	"default value for override_multi_region_zone_config; "+
+		"allows for overriding the zone configs of a multi-region table or database",
+	false,
+)
+
 var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_hash_sharded_indexes.enabled",
 	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
@@ -941,9 +948,16 @@ type ExecutorTestingKnobs struct {
 	// unsupported and will lead to a panic.
 	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec) error
 
-	// DeterministicExplainAnalyze, if set, will result in overriding fields in
-	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
-	DeterministicExplainAnalyze bool
+	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
+	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
+	//
+	// TODO(radu): this flag affects EXPLAIN and EXPLAIN ANALYZE differently. It
+	// hides the vectorization, distribution, and cluster nodes in EXPLAIN ANALYZE
+	// but not in EXPLAIN. This is just a consequence of how the tests we have are
+	// written. We should replace this knob with a session setting that allows
+	// exact control of the redaction flags (and have each test set it as
+	// necessary).
+	DeterministicExplain bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -1642,16 +1656,18 @@ func (st *SessionTracing) StartTracing(
 		return nil
 	}
 
-	// If we're inside a transaction, start recording on the txn span.
+	// If we're inside a transaction, hijack the txn's ctx with one that has a
+	// recording span.
 	if _, ok := st.ex.machine.CurState().(stateNoTxn); !ok {
-		sp := tracing.SpanFromContext(st.ex.state.Ctx)
-		if sp == nil {
+		txnCtx := st.ex.state.Ctx
+		if sp := tracing.SpanFromContext(txnCtx); sp == nil {
 			return errors.Errorf("no txn span for SessionTracing")
 		}
-		// We want to clear out any existing recordings so they don't show up in
-		// future traces.
-		sp.ResetRecording()
+
+		newTxnCtx, sp := tracing.EnsureChildSpan(txnCtx, st.ex.server.cfg.AmbientCtx.Tracer,
+			"session tracing", tracing.WithForceRealSpan())
 		sp.SetVerbose(true)
+		st.ex.state.Ctx = newTxnCtx
 		st.firstTxnSpan = sp
 	}
 
@@ -2307,6 +2323,10 @@ func (m *sessionDataMutator) SetImplicitColumnPartitioningEnabled(val bool) {
 
 func (m *sessionDataMutator) SetDropEnumValueEnabled(val bool) {
 	m.data.DropEnumValueEnabled = val
+}
+
+func (m *sessionDataMutator) SetOverrideMultiRegionZoneConfigEnabled(val bool) {
+	m.data.OverrideMultiRegionZoneConfigEnabled = val
 }
 
 func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {

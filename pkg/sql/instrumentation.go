@@ -92,11 +92,9 @@ type instrumentationHelper struct {
 	finishCollectionDiagnostics func()
 	withStatementTrace          func(trace tracing.Recording, stmt string)
 
-	sp *tracing.Span
-	// If true, the instrumentation helper is responsible for finishing sp.
-	finishSpan bool
-	origCtx    context.Context
-	evalCtx    *tree.EvalContext
+	sp      *tracing.Span
+	origCtx context.Context
+	evalCtx *tree.EvalContext
 
 	// If savePlanForStats is true, the explainPlan will be collected and returned
 	// via PlanForStats().
@@ -167,8 +165,6 @@ func (ih *instrumentationHelper) Setup(
 	ih.savePlanForStats = appStats.shouldSaveLogicalPlanDescription(fingerprint, implicitTxn)
 
 	if sp := tracing.SpanFromContext(ctx); sp != nil {
-		ih.sp = sp
-		ih.finishSpan = false
 		if sp.IsVerbose() {
 			// If verbose tracing was enabled at a higher level, stats
 			// collection is enabled so that stats are shown in the traces, but
@@ -186,18 +182,10 @@ func (ih *instrumentationHelper) Setup(
 
 	if !ih.collectBundle && ih.withStatementTrace == nil && ih.outputMode == unmodifiedOutput {
 		if ih.collectExecStats {
+			// If we need to collect stats, create a non-verbose child span. Stats
+			// will be added as structured metadata and processed in Finish.
 			ih.origCtx = ctx
-			if ih.sp != nil {
-				// The span present in the context is sufficient for us to
-				// record stats as structured metadata, so there is nothing else
-				// to do.
-				return ctx, true
-			}
-			// This is an edge case when the span is not present in the original
-			// context for some reason. This should *never* happen, but we
-			// choose to be defensive about it.
-			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement")
-			ih.finishSpan = true
+			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithForceRealSpan())
 			return newCtx, true
 		}
 		return ctx, false
@@ -208,7 +196,6 @@ func (ih *instrumentationHelper) Setup(
 	ih.origCtx = ctx
 	ih.evalCtx = p.EvalContext()
 	newCtx, ih.sp = tracing.StartVerboseTrace(ctx, cfg.AmbientCtx.Tracer, "traced statement")
-	ih.finishSpan = true
 	return newCtx, true
 }
 
@@ -224,9 +211,10 @@ func (ih *instrumentationHelper) Finish(
 	retErr error,
 ) error {
 	ctx := ih.origCtx
-	if ih.finishSpan {
-		ih.sp.Finish()
+	if ih.sp == nil {
+		return retErr
 	}
+	ih.sp.Finish()
 
 	// Record the statement information that we've collected.
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
@@ -241,7 +229,7 @@ func (ih *instrumentationHelper) Finish(
 			ih.explainPlan,
 			p.curPlan.distSQLFlowInfos,
 			trace,
-			cfg.TestingKnobs.DeterministicExplainAnalyze,
+			cfg.TestingKnobs.DeterministicExplain,
 		)
 	}
 
@@ -250,7 +238,7 @@ func (ih *instrumentationHelper) Finish(
 	for _, flowInfo := range p.curPlan.distSQLFlowInfos {
 		flowsMetadata = append(flowsMetadata, flowInfo.flowsMetadata)
 	}
-	queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplainAnalyze, flowsMetadata)
+	queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplain, flowsMetadata)
 	if err != nil {
 		const msg = "error getting query level stats for statement: %s: %+v"
 		if util.CrdbTestBuild {
@@ -352,6 +340,11 @@ func (ih *instrumentationHelper) ShouldBuildExplainPlan() bool {
 // statistics.
 func (ih *instrumentationHelper) ShouldCollectExecStats() bool {
 	return ih.collectExecStats
+}
+
+// ShouldSaveMemo returns true if we should save the memo and catalog in planTop.
+func (ih *instrumentationHelper) ShouldSaveMemo() bool {
+	return ih.ShouldBuildExplainPlan()
 }
 
 // RecordExplainPlan records the explain.Plan for this query.

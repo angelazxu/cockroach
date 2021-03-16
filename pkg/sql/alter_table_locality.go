@@ -73,7 +73,10 @@ func (p *planner) AlterTableLocality(
 		ctx,
 		p.txn,
 		tableDesc.GetParentID(),
-		tree.DatabaseLookupFlags{Required: true},
+		tree.DatabaseLookupFlags{
+			AvoidCached: true,
+			Required:    true,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -348,7 +351,7 @@ func (n *alterTableSetLocalityNode) alterTableLocalityToRegionalByRow(
 		}
 
 		// Allow add column mutation to be on the same mutation ID in AlterPrimaryKey.
-		mutationIdx := len(n.tableDesc.GetMutations()) - 1
+		mutationIdx := len(n.tableDesc.Mutations) - 1
 		mutationIdxAllowedInSameTxn = &mutationIdx
 		newColumnName = &partColName
 
@@ -363,7 +366,7 @@ func (n *alterTableSetLocalityNode) alterTableLocalityToRegionalByRow(
 		// The primary_region default helps us also have a material value.
 		// This can be removed when the default_expr can serialize user defined
 		// functions.
-		col := n.tableDesc.GetMutations()[mutationIdx].GetColumn()
+		col := n.tableDesc.Mutations[mutationIdx].GetColumn()
 		finalDefaultExpr, err := schemaexpr.SanitizeVarFreeExpr(
 			params.ctx,
 			regionalByRowGatewayRegionDefaultExpr(enumOID),
@@ -470,6 +473,19 @@ func (n *alterTableSetLocalityNode) startExec(params runParams) error {
 			newLocality.TelemetryName(),
 		),
 	)
+
+	toRegionalByRow := newLocality.LocalityLevel == tree.LocalityLevelRow
+	if err := validateZoneConfigForMultiRegionTableWasNotModifiedByUser(
+		params.ctx,
+		params.extendedEvalCtx.Txn,
+		params.ExecCfg(),
+		*n.dbDesc.RegionConfig,
+		n.tableDesc,
+		toRegionalByRow,
+		params.p.SessionData().OverrideMultiRegionZoneConfigEnabled,
+		ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes); err != nil {
+		return err
+	}
 
 	// Look at the existing locality, and implement any changes required to move to
 	// the new locality.

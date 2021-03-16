@@ -211,6 +211,8 @@ func (p *planner) CommonLookupFlags(required bool) tree.CommonLookupFlags {
 func (p *planner) IsTableVisible(
 	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID int64,
 ) (isVisible, exists bool, err error) {
+	// TODO(ajwerner): look at this error and only no-op if it is
+	// ErrDescriptorNotFound or something like it.
 	tableDesc, err := p.LookupTableByID(ctx, descpb.ID(tableID))
 	if err != nil {
 		// If an error happened here, it means the table doesn't exist, so we
@@ -937,16 +939,40 @@ func (l *internalLookupCtx) getSchemaByID(id descpb.ID) (*schemadesc.Immutable, 
 	return sc, nil
 }
 
-func (l *internalLookupCtx) getParentName(table catalog.TableDescriptor) string {
+// getSchemaNameByID returns the schema name given an ID for a schema.
+func (l *internalLookupCtx) getSchemaNameByID(id descpb.ID) (string, error) {
+	if id == keys.PublicSchemaID {
+		return tree.PublicSchema, nil
+	}
+	schema, err := l.getSchemaByID(id)
+	if err != nil {
+		return "", err
+	}
+	return schema.GetName(), nil
+}
+
+func (l *internalLookupCtx) getDatabaseName(table catalog.TableDescriptor) string {
 	parentName := l.dbNames[table.GetParentID()]
 	if parentName == "" {
 		// The parent database was deleted. This is possible e.g. when
 		// a database is dropped with CASCADE, and someone queries
-		// this virtual table before the dropped table descriptors are
+		// this table before the dropped table descriptors are
 		// effectively deleted.
 		parentName = fmt.Sprintf("[%d]", table.GetParentID())
 	}
 	return parentName
+}
+
+func (l *internalLookupCtx) getSchemaName(table catalog.TableDescriptor) string {
+	schemaName := l.schemaNames[table.GetParentSchemaID()]
+	if schemaName == "" {
+		// The parent schema was deleted. This is possible e.g. when
+		// a schema is dropped with CASCADE, and someone queries
+		// this table before the dropped table descriptors are
+		// effectively deleted.
+		schemaName = fmt.Sprintf("[%d]", table.GetParentSchemaID())
+	}
+	return schemaName
 }
 
 // getParentAsTableName returns a TreeTable object of the parent table for a
